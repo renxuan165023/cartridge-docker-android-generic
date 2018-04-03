@@ -1,0 +1,314 @@
+// Folders
+def workspaceFolderName = "${WORKSPACE_NAME}"
+def projectFolderName = "${PROJECT_NAME}"
+
+// Variables
+def referenceAppGitUrl = "ssh://jenkins@gerrit.service.adop.consul:29418/${PROJECT_NAME}/${GIT_REPOSITORY}"
+def gitCucumberUrl = "ssh://jenkins@gerrit.service.adop.consul:29418/${PROJECT_NAME}/${AUTOMATION_TEST_REPOSITORY}"
+
+// Jobs
+def buildAppJob = freeStyleJob(projectFolderName + "/Build_App")
+def codeAnalysisJob = freeStyleJob(projectFolderName + "/Code_Analysis")
+def publishPackageJob = freeStyleJob(projectFolderName + "/Publish_App_Package")
+def testAutomationJob = freeStyleJob(projectFolderName + "/Test_Automation")
+def pushToTestFairy = freeStyleJob(projectFolderName + "/Push_To_TestFairy")
+
+// Views
+def pipelineView = buildPipelineView(projectFolderName + "/ReferenceApplication")
+
+pipelineView.with{
+    title('ReferenceApplication Pipeline')
+    displayedBuilds(5)
+    selectedJob(projectFolderName + "/Build_App")
+    showPipelineParameters()
+    showPipelineDefinitionHeader()
+    refreshFrequency(5)
+}
+
+buildAppJob.with{
+  description("Build reference app")
+  wrappers {
+    preBuildCleanup()
+    injectPasswords()
+    maskPasswords()
+    sshAgent("adop-jenkins-master")
+  }
+  scm{
+    git{
+      remote{
+        url(referenceAppGitUrl)
+        credentials("adop-jenkins-master")
+      }
+      branch("*/develop")
+    }
+  }
+  environmentVariables {
+      env('WORKSPACE_NAME',workspaceFolderName)
+      env('PROJECT_NAME',projectFolderName)
+  }
+  label("${SLAVE_LABEL}")
+  triggers{
+    gerrit{
+      events{
+        refUpdated()
+      }
+      configure { gerritxml ->
+        gerritxml / 'gerritProjects' {
+          'com.sonyericsson.hudson.plugins.gerrit.trigger.hudsontrigger.data.GerritProject' {
+            compareType("PLAIN")
+            pattern(projectFolderName + "/${GIT_REPOSITORY}")
+            'branches' {
+              'com.sonyericsson.hudson.plugins.gerrit.trigger.hudsontrigger.data.Branch' {
+                compareType("PLAIN")
+                pattern("develop")
+              }
+            }
+          }
+        }
+        gerritxml / serverName("ADOP Gerrit")
+      }
+    }
+  }
+  steps {
+    shell('''set +x
+            |cat <<EOT >> app/build.gradle
+            |android {
+            |
+            |    defaultConfig {
+            |        multiDexEnabled true
+            |    }
+            |
+            |    dexOptions {
+            |        preDexLibraries = false
+            |    }
+            |
+            |    afterEvaluate {
+            |        tasks.matching {
+            |            it.name.startsWith('dex')
+            |        }.each { dx ->
+            |            if (dx.additionalParameters == null) {
+            |                dx.additionalParameters = []
+            |            }
+            |            dx.additionalParameters += "--set-max-idx-number=55000"
+            |        }
+            |    }
+            |}
+            |
+            |dependencies {
+            |    compile 'com.android.support:multidex:1.0.0'
+            |}
+            |EOT
+            |
+            |export ANDROID_HOME=/opt/android-sdk-linux 
+            |bash ./gradlew lintDebug 
+            |bash ./gradlew build
+            |set -x'''.stripMargin())
+  }
+  publishers{
+    archiveArtifacts("**/*")
+    downstreamParameterized{
+      trigger(projectFolderName + "/Code_Analysis"){
+        condition("UNSTABLE_OR_BETTER")
+        parameters{
+          predefinedProp("B",'${BUILD_NUMBER}')
+          predefinedProp("PARENT_BUILD", '${JOB_NAME}')
+        }
+      }
+    }
+  }
+}
+
+codeAnalysisJob.with{
+  description("Code quality analysis for Java reference application using SonarQube.")
+  parameters{
+    stringParam("B",'',"Parent build number")
+    stringParam("PARENT_BUILD","Build_App","Parent build name")
+  }
+  environmentVariables {
+      env('WORKSPACE_NAME',workspaceFolderName)
+      env('PROJECT_NAME',projectFolderName)
+  }
+  label("${SLAVE_LABEL}")
+  wrappers {
+    preBuildCleanup()
+    injectPasswords()
+    maskPasswords()
+    sshAgent("adop-jenkins-master")
+  }
+  steps {
+    copyArtifacts('Build_App') {
+        buildSelector {
+          buildNumber('${B}')
+      }
+    }
+  }
+  configure { myProject ->
+    myProject / builders << 'hudson.plugins.sonar.SonarRunnerBuilder'(plugin:"sonar@2.2.1"){
+      properties('''sonar.projectKey=org.android.reference-application
+                    sonar.projectName=Android Reference application
+                    sonar.projectVersion=1.0.0
+                    sonar.sources=app/src,MaterialNavigationDrawerModule/src
+                    sonar.language=java
+                    sonar.sourceEncoding=UTF-8
+                    sonar.scm.enabled=false
+                    sonar.android.lint.report=app/build/outputs/lint-results.xml
+                ''')
+      javaOpts()
+      jdk('(Inherit From Job)')
+      task()
+    }
+  }
+  publishers{
+    downstreamParameterized{
+      trigger(projectFolderName + "/Publish_App_Package"){
+        condition("UNSTABLE_OR_BETTER")
+        parameters{
+          predefinedProp("B",'${B}')
+          predefinedProp("PARENT_BUILD", '${PARENT_BUILD}')
+        }
+      }
+    }
+  }
+}
+
+publishPackageJob.with{
+  parameters{
+    stringParam("B",'',"Parent build number")
+    stringParam("PARENT_BUILD","Build_App","Parent build name")
+    stringParam("NEXUS_ARTEFACT_NAME","${NEXUS_ARTEFACT_NAME}","Default Nexus artefact name")
+  }
+  wrappers {
+    preBuildCleanup()
+    injectPasswords()
+    maskPasswords()
+    sshAgent("adop-jenkins-master")
+  }
+  environmentVariables {
+      env('WORKSPACE_NAME',workspaceFolderName)
+      env('PROJECT_NAME',projectFolderName)
+  }
+  label("${SLAVE_LABEL}")
+  steps {
+    copyArtifacts("Build_App") {
+        buildSelector {
+          buildNumber('${B}')
+      }
+    }
+  }
+  steps {
+    shell('''set +x
+            |GROUP_NAME=$(echo ${PROJECT_NAME} | tr '/' '.')
+            |echo "GROUP_NAME=${GROUP_NAME}" > env.properties
+            |echo '
+            |<?xml version="1.0" encoding="UTF-8"?>
+            |<settings xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.1.0 http://maven.apache.org/xsd/settings-1.1.0.xsd" xmlns="http://maven.apache.org/SETTINGS/1.1.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            |  <servers>
+            |    <server>
+            |      <id>releases</id>
+            |      <username>nexus</username>
+            |      <password>Password01</password>
+            |    </server>
+            |  </servers>
+            |</settings>
+            |' > settings.xml
+            |set -x'''.stripMargin())
+    environmentVariables {
+      propertiesFile('env.properties')
+    }
+    maven{
+      goals('deploy:deploy-file -Dversion=${B} -DgeneratePom=true -Dpackaging=apk -Dfile=app/build/outputs/apk/app-debug.apk -DgroupId=${GROUP_NAME} -DartifactId=${NEXUS_ARTEFACT_NAME} -DrepositoryId=releases -Durl=http://nexus.service.adop.consul/content/repositories/releases')
+      mavenInstallation("ADOP Maven")
+    }
+  }
+  configure { myProject ->
+    myProject / builders / 'hudson.tasks.Maven' << 'settings'(class:"jenkins.mvn.FilePathSettingsProvider") {
+      path('settings.xml')
+    }
+  }
+  publishers{
+    downstreamParameterized{
+      trigger(projectFolderName + "/Test_Automation"){
+        condition("UNSTABLE_OR_BETTER")
+        parameters{
+          predefinedProp("B",'${B}')
+          predefinedProp("PARENT_BUILD",'${PARENT_BUILD}')
+        }
+      }
+    }
+  }
+}
+
+testAutomationJob.with{
+  description("Test automation")
+  parameters{
+    stringParam("B",'',"Parent build number")
+    stringParam("PARENT_BUILD","Build_App","Parent build name")
+  }
+  scm{
+    git{
+      remote{
+        url(gitCucumberUrl)
+        credentials("adop-jenkins-master")
+      }
+      branch("*/master")
+    }
+  }
+  wrappers {
+    preBuildCleanup()
+    injectPasswords()
+    maskPasswords()
+    sshAgent("adop-jenkins-master")
+  }
+  environmentVariables {
+      env('WORKSPACE_NAME',workspaceFolderName)
+      env('PROJECT_NAME',projectFolderName)
+  }
+  label("${SLAVE_LABEL}")
+  publishers{
+    downstreamParameterized{
+      trigger(projectFolderName + "/Push_To_TestFairy"){
+        condition("UNSTABLE_OR_BETTER")
+        parameters{
+          predefinedProp("B",'${B}')
+          predefinedProp("PARENT_BUILD",'${PARENT_BUILD}')
+        }
+      }
+    }
+  }
+}
+
+pushToTestFairy.with{
+  description("Test automation")
+  parameters{
+    stringParam("B",'',"Parent build number")
+    stringParam("PARENT_BUILD","Build_App","Parent build name")
+    configure { project ->
+      project / 'properties' / 'hudson.model.ParametersDefinitionProperty'/ 'parameterDefinitions' << 'hudson.model.PasswordParameterDefinition' {
+        name("FAIRY_API_KEY")
+        description("API key to upload the the apk to testfairy.")
+        defaultValue("${FAIRY_API_KEY}")
+      }
+    }
+  }
+  steps {
+    copyArtifacts("Build_App") {
+        buildSelector {
+          buildNumber('${B}')
+      }
+    }
+    shell('''set +x
+            |echo "curl https://app.testfairy.com/api/upload -F api_key=${FAIRY_API_KEY} -F file=@app/build/outputs/apk/app-debug.apk"
+            |set -x'''.stripMargin())
+  }
+  wrappers {
+    preBuildCleanup()
+    injectPasswords()
+    maskPasswords()
+    sshAgent("adop-jenkins-master")
+  }
+  environmentVariables {
+      env('WORKSPACE_NAME',workspaceFolderName)
+      env('PROJECT_NAME',projectFolderName)
+  }
+  label("${SLAVE_LABEL}")
+}

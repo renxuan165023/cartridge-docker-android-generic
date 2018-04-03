@@ -1,0 +1,2 @@
+git@innersource.accenture.com:adop-b-framework-avs/android-referece-app.git
+git@innersource.accenture.com:adop-b-framework-avs/android-automation-test.git
